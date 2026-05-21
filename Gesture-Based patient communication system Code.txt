@@ -1,0 +1,324 @@
+#include <LiquidCrystal_I2C.h>
+#include <SoftwareSerial.h>
+
+// ================= LCD SETUP =================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ================= BLUETOOTH =================
+SoftwareSerial bluetooth(2, 3); // RX, TX
+
+// ================= FLEX SENSORS =================
+const int flexPins[5] = {A0, A1, A2, A3, A4};
+
+int flexMin[5] = {1023, 1023, 1023, 1023, 1023};
+int flexMax[5] = {0, 0, 0, 0, 0};
+
+int flexValues[5];
+int flexThreshold[5];
+
+// ================= SMOOTHING =================
+#define NUM_READINGS 5
+
+int readings[5][NUM_READINGS];
+int readIndex = 0;
+
+// ================= ADXL335 =================
+const int adxlPinX = A5;
+const int adxlPinY = A6;
+const int adxlPinZ = A7;
+
+int adxlX, adxlY, adxlZ;
+
+// ================= GESTURE TIMING =================
+unsigned long lastGestureTime = 0;
+const int GESTURE_HOLD_MS = 1500;
+
+// ================= SETUP =================
+void setup() {
+
+  Serial.begin(9600);
+  bluetooth.begin(9600);
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Healthcare");
+  lcd.setCursor(0, 1);
+  lcd.print("Glove System");
+
+  delay(2000);
+
+  // Initialize smoothing buffers
+  for (int i = 0; i < 5; i++) {
+    for (int j = 0; j < NUM_READINGS; j++) {
+      readings[i][j] = analogRead(flexPins[i]);
+    }
+  }
+
+  calibrateSensors();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready");
+
+  delay(1500);
+}
+
+// ================= MAIN LOOP =================
+void loop() {
+
+  readSensors();
+
+  // Serial Monitor Debug
+  Serial.print("Flex: ");
+
+  for (int i = 0; i < 5; i++) {
+    Serial.print(flexValues[i]);
+    Serial.print(" ");
+  }
+
+  Serial.print(" | Y: ");
+  Serial.println(adxlY);
+
+  static const char* lastGesture = "";
+
+  const char* gesture = detectGesture();
+
+  if (strcmp(gesture, "") != 0 &&
+      strcmp(gesture, lastGesture) != 0 &&
+      (millis() - lastGestureTime > GESTURE_HOLD_MS)) {
+
+    displayMessage(gesture);
+
+    lastGesture = gesture;
+    lastGestureTime = millis();
+  }
+
+  delay(100);
+}
+
+// ================= CALIBRATION =================
+void calibrateSensors() {
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("OPEN HAND");
+
+  delay(5000);
+
+  // Open hand = minimum bend
+  for (int i = 0; i < 5; i++) {
+    flexMin[i] = analogRead(flexPins[i]);
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("MAKE FIST");
+
+  delay(5000);
+
+  // Closed fist = maximum bend
+  for (int i = 0; i < 5; i++) {
+    flexMax[i] = analogRead(flexPins[i]);
+  }
+
+  // Fix min/max and generate thresholds
+  for (int i = 0; i < 5; i++) {
+
+    if (flexMin[i] > flexMax[i]) {
+      int temp = flexMin[i];
+      flexMin[i] = flexMax[i];
+      flexMax[i] = temp;
+    }
+
+    flexMin[i] -= 10;
+    flexMax[i] += 10;
+
+    flexThreshold[i] =
+      map(50, 0, 100, flexMin[i], flexMax[i]);
+
+    Serial.print("Sensor ");
+    Serial.print(i);
+
+    Serial.print(" Min=");
+    Serial.print(flexMin[i]);
+
+    Serial.print(" Max=");
+    Serial.print(flexMax[i]);
+
+    Serial.print(" Threshold=");
+    Serial.println(flexThreshold[i]);
+  }
+
+  lcd.clear();
+  lcd.print("Calibration");
+  lcd.setCursor(0, 1);
+  lcd.print("Complete");
+
+  delay(2000);
+}
+
+// ================= READ SENSORS =================
+void readSensors() {
+
+  // Store new readings
+  for (int i = 0; i < 5; i++) {
+    readings[i][readIndex] = analogRead(flexPins[i]);
+  }
+
+  readIndex = (readIndex + 1) % NUM_READINGS;
+
+  // Moving average smoothing
+  for (int i = 0; i < 5; i++) {
+
+    int sum = 0;
+
+    for (int j = 0; j < NUM_READINGS; j++) {
+      sum += readings[i][j];
+    }
+
+    int avg = sum / NUM_READINGS;
+
+    flexValues[i] =
+      map(avg, flexMin[i], flexMax[i], 0, 100);
+
+    flexValues[i] =
+      constrain(flexValues[i], 0, 100);
+  }
+
+  // Accelerometer
+  adxlX = analogRead(adxlPinX);
+  adxlY = analogRead(adxlPinY);
+  adxlZ = analogRead(adxlPinZ);
+}
+
+// ================= DETECT GESTURES =================
+const char* detectGesture() {
+
+  bool bent[5];
+
+  for (int i = 0; i < 5; i++) {
+    bent[i] = (flexValues[i] > 50);
+  }
+
+  bool isVertical =
+    (adxlY > 580 && adxlY < 750);
+
+  // ==================================================
+  // Gesture 1 -> NEED WATER
+  // Fist
+  // ==================================================
+  if (bent[0] && bent[1] &&
+      bent[2] && bent[3] &&
+      bent[4]) {
+
+    return "Need Water";
+  }
+
+  // ==================================================
+  // Gesture 2 -> NEED HELP
+  // Open Palm
+  // ==================================================
+  if (!bent[0] && !bent[1] &&
+      !bent[2] && !bent[3] &&
+      !bent[4]) {
+
+    return "Need Help";
+  }
+
+  // ==================================================
+  // Gesture 3 -> NEED DOCTOR
+  // Pointing Finger
+  // ==================================================
+  if (!bent[0] && !bent[1] &&
+      bent[2] && bent[3] &&
+      bent[4]) {
+
+    return "Need Doctor";
+  }
+
+  // ==================================================
+  // Gesture 4 -> I AM FINE
+  // OK Sign
+  // ==================================================
+  if (bent[0] && bent[1] &&
+      !bent[2] && !bent[3] &&
+      !bent[4]) {
+
+    return "I Am Fine";
+  }
+
+  // ==================================================
+  // Gesture 5 -> PAIN
+  // Thumb Bent
+  // ==================================================
+  if (bent[0] &&
+      !bent[1] &&
+      bent[2] &&
+      bent[3] &&
+      bent[4]) {
+
+    return "Pain";
+  }
+
+  // ==================================================
+  // Gesture 6 -> CALL FAMILY
+  // Thumb + Pinky
+  // ==================================================
+  if (bent[0] &&
+      !bent[1] &&
+      !bent[2] &&
+      !bent[3] &&
+      bent[4]) {
+
+    return "Call Family";
+  }
+
+  // ==================================================
+  // Gesture 7 -> NEED MEDICINE
+  // Two Fingers
+  // ==================================================
+  if (!bent[0] &&
+      !bent[1] &&
+      !bent[2] &&
+      bent[3] &&
+      bent[4]) {
+
+    return "Medicine";
+  }
+
+  // ==================================================
+  // Gesture 8 -> EMERGENCY
+  // Vertical Hand
+  // ==================================================
+  if (!bent[0] &&
+      bent[1] &&
+      bent[2] &&
+      !bent[3] &&
+      !bent[4] &&
+      isVertical) {
+
+    return "Emergency";
+  }
+
+  return "";
+}
+
+// ================= DISPLAY MESSAGE =================
+void displayMessage(const char* msg) {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Patient Says:");
+
+  lcd.setCursor(0, 1);
+  lcd.print(msg);
+
+  // Bluetooth Output
+  bluetooth.println(msg);
+
+  // Serial Monitor
+  Serial.println(msg);
+}
